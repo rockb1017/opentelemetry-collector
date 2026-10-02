@@ -12,7 +12,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
@@ -135,18 +134,4 @@ func TestNewLogsRequestsRequestSizerChargesEveryDescriptor(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestNewLogsRequestsRejectsPersistentQueue(t *testing.T) {
-	q := exporterhelper.NewDefaultQueueConfig()
-	storageID := component.NewID(component.MustNewType("storage"))
-	q.StorageID = &storageID
-	q.Batch = configoptional.Optional[exporterhelper.BatchConfig]{}
-	exp, err := NewLogsRequests(context.Background(), exportertest.NewNopSettings(exportertest.NopType),
-		func(_ context.Context, ld plog.Logs) ([]Descriptor[plog.Logs], error) {
-			return []Descriptor[plog.Logs]{{Request: ld, PartitionKey: "p"}}, nil
-		}, func(context.Context, Dispatch[plog.Logs], Completion) error { return nil },
-		orderedStreamTestSettings(), WithQueueBatch(configoptional.Some(q), NewLogsQueueBatchSettings()))
-	require.ErrorContains(t, err, "ordered stream persistent queues are not supported")
-	require.Nil(t, exp)
 }

@@ -4,11 +4,15 @@
 package internal
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -26,6 +30,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/xpdata/pref"
+	pdatareq "go.opentelemetry.io/collector/pdata/xpdata/request"
 	"go.opentelemetry.io/collector/pipeline"
 )
 
@@ -100,9 +105,14 @@ func (s OrderedLogsSettings) Validate() error {
 }
 
 type orderedLogsGroup struct {
-	children []OrderedLogsDescriptor
-	items    int
-	bytes    int
+	children        []OrderedLogsDescriptor
+	items           int
+	bytes           int
+	checkpointStore request.QueueCheckpointStore
+	persistCtx      context.Context
+	queueToken      uint64
+	durable         bool
+	retired         map[[16]byte]bool
 
 	mu         sync.Mutex
 	completion func(error)
@@ -112,11 +122,19 @@ type orderedLogsGroup struct {
 }
 
 var (
-	_ request.Request                 = (*orderedLogsGroup)(nil)
-	_ request.DeferredQueueCompletion = (*orderedLogsGroup)(nil)
+	_ request.Request                    = (*orderedLogsGroup)(nil)
+	_ request.DeferredQueueCompletion    = (*orderedLogsGroup)(nil)
+	_ request.QueueCheckpointStoreSetter = (*orderedLogsGroup)(nil)
 )
 
-func (g *orderedLogsGroup) QueueRequestsCount() int64 { return int64(len(g.children)) }
+func (g *orderedLogsGroup) SetQueueItemToken(token uint64) { g.queueToken, g.durable = token, true }
+func (g *orderedLogsGroup) QueueRequestsCount() int64      { return int64(len(g.children)) }
+
+func (g *orderedLogsGroup) SetQueueCheckpointStore(store request.QueueCheckpointStore) {
+	g.mu.Lock()
+	g.checkpointStore = store
+	g.mu.Unlock()
+}
 
 func (g *orderedLogsGroup) SetQueueCompletion(done func(error)) bool {
 	g.mu.Lock()
@@ -162,7 +180,115 @@ func (g *orderedLogsGroup) MergeSplit(context.Context, int, request.SizerType, r
 	return nil, errors.New("ordered request groups cannot be batched or split")
 }
 
-var orderedLogsWire = &plog.ProtoMarshaler{}
+type orderedLogsEncoding struct{}
+
+var (
+	orderedLogsMagic = []byte{'O', 'T', 'O', 'G', 3}
+	orderedLogsWire  = &plog.ProtoMarshaler{}
+)
+
+const orderedLogsCheckpointKey = "ordered-stream-v1"
+
+func (orderedLogsEncoding) Marshal(ctx context.Context, req request.Request) ([]byte, error) {
+	g, ok := req.(*orderedLogsGroup)
+	if !ok {
+		return nil, fmt.Errorf("ordered logs encoding: unexpected request %T", req)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out bytes.Buffer
+	out.Write(orderedLogsMagic)
+	if err := binary.Write(&out, binary.BigEndian, uint32(len(g.children))); err != nil {
+		return nil, err
+	}
+	for _, child := range g.children {
+		if child.QueueID == ([16]byte{}) {
+			return nil, errors.New("ordered logs encoding: missing queue item ID")
+		}
+		if len(child.PartitionKey) > math.MaxUint32 {
+			return nil, errors.New("ordered logs encoding: partition key too large")
+		}
+		payload, err := pdatareq.MarshalLogs(ctx, child.Request)
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) > math.MaxUint32 {
+			return nil, errors.New("ordered logs encoding: child request too large")
+		}
+		_ = binary.Write(&out, binary.BigEndian, uint32(len(child.PartitionKey)))
+		out.WriteString(child.PartitionKey)
+		out.WriteByte(byte(child.Position))
+		out.Write(child.QueueID[:])
+		if g.retired[child.QueueID] {
+			out.WriteByte(1)
+		} else {
+			out.WriteByte(0)
+		}
+		_ = binary.Write(&out, binary.BigEndian, uint32(len(payload)))
+		out.Write(payload)
+	}
+	return out.Bytes(), nil
+}
+
+func (orderedLogsEncoding) Unmarshal(encoded []byte) (context.Context, request.Request, error) {
+	if len(encoded) < len(orderedLogsMagic)+4 || !bytes.Equal(encoded[:len(orderedLogsMagic)], orderedLogsMagic) {
+		return nil, nil, errors.New("ordered logs encoding: invalid group header")
+	}
+	r := bytes.NewReader(encoded[len(orderedLogsMagic):])
+	var count uint32
+	if err := binary.Read(r, binary.BigEndian, &count); err != nil || count > 1<<20 {
+		return nil, nil, errors.New("ordered logs encoding: invalid child count")
+	}
+	g := &orderedLogsGroup{children: make([]OrderedLogsDescriptor, 0, count), retired: make(map[[16]byte]bool)}
+	for range count {
+		var keyLen uint32
+		if err := binary.Read(r, binary.BigEndian, &keyLen); err != nil || uint64(keyLen) > uint64(r.Len()) {
+			return nil, nil, errors.New("ordered logs encoding: invalid partition key length")
+		}
+		key := make([]byte, keyLen)
+		if _, err := io.ReadFull(r, key); err != nil {
+			return nil, nil, err
+		}
+		pos, positionErr := r.ReadByte()
+		if positionErr != nil || OrderedPosition(pos) > OrderedPositionEnd {
+			return nil, nil, errors.New("ordered logs encoding: invalid stream position")
+		}
+		var queueID [16]byte
+		if _, err := io.ReadFull(r, queueID[:]); err != nil || queueID == ([16]byte{}) {
+			return nil, nil, errors.New("ordered logs encoding: invalid queue item ID")
+		}
+		retired, retirementErr := r.ReadByte()
+		if retirementErr != nil || retired > 1 {
+			return nil, nil, errors.New("ordered logs encoding: invalid child retirement flag")
+		}
+		g.retired[queueID] = retired == 1
+		var payloadLen uint32
+		if err := binary.Read(r, binary.BigEndian, &payloadLen); err != nil || uint64(payloadLen) > uint64(r.Len()) {
+			return nil, nil, errors.New("ordered logs encoding: invalid child payload length")
+		}
+		payload := make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, nil, err
+		}
+		ctx, ld, err := pdatareq.UnmarshalLogs(payload)
+		if err != nil {
+			return nil, nil, err
+		}
+		if g.persistCtx == nil {
+			g.persistCtx = ctx //nolint:fatcontext // Restore the first decoded context; this does not derive a context in the loop.
+		}
+		g.children = append(g.children, OrderedLogsDescriptor{Request: ld, PartitionKey: string(key), Position: OrderedPosition(pos), QueueID: queueID})
+		g.items += ld.LogRecordCount()
+		g.bytes += orderedLogsTailSize(OrderedLogsDescriptor{Request: ld, PartitionKey: string(key)})
+	}
+	if r.Len() != 0 {
+		return nil, nil, errors.New("ordered logs encoding: trailing bytes")
+	}
+	if g.persistCtx == nil {
+		g.persistCtx = context.Background()
+	}
+	return g.persistCtx, g, nil
+}
 
 type orderedLogsReferenceCounter struct{}
 
@@ -181,6 +307,7 @@ func (orderedLogsReferenceCounter) Unref(req request.Request) {
 func NewOrderedLogsQueueBatchSettings() queuebatch.Settings[request.Request] {
 	return queuebatch.Settings[request.Request]{
 		ReferenceCounter: orderedLogsReferenceCounter{},
+		Encoding:         orderedLogsEncoding{},
 	}
 }
 
@@ -233,6 +360,8 @@ type orderedLogsCoordinator struct {
 	retryCfg         configretry.BackOffConfig
 	timeout          time.Duration
 	logger           *zap.Logger
+	checkpointStore  request.QueueCheckpointStore
+	restored         bool
 	stop             chan struct{}
 	stopped          bool
 }
@@ -244,6 +373,50 @@ func newOrderedLogsCoordinator(set OrderedLogsSettings, consume OrderedLogsConsu
 	c := &orderedLogsCoordinator{parts: make(map[string]*orderedLogsPartition), settings: set, consume: consume, retryCfg: retry, timeout: timeout, maxWorkers: maxWorkers, logger: logger, stop: make(chan struct{})}
 	c.changed = sync.NewCond(&c.mu)
 	return c
+}
+
+func (c *orderedLogsCoordinator) restoreCheckpointLocked(ctx context.Context, store request.QueueCheckpointStore) error {
+	if store == nil {
+		return nil
+	}
+	encoded, found, err := store.LoadCheckpoint(ctx, orderedLogsCheckpointKey)
+	if err != nil || !found {
+		return err
+	}
+	_, decoded, err := (orderedLogsEncoding{}).Unmarshal(encoded)
+	if err != nil {
+		return err
+	}
+	checkpoint := decoded.(*orderedLogsGroup)
+	if len(checkpoint.children) > c.settings.MaxActivePartitions {
+		return errors.New("checkpoint has more tails than the active-partition limit")
+	}
+	seen := make(map[string]struct{}, len(checkpoint.children))
+	totalBytes := 0
+	for _, child := range checkpoint.children {
+		if child.PartitionKey == "" || len(child.PartitionKey) > c.settings.MaxPartitionKeyBytes || child.Position != OrderedPositionContinue || child.Request.LogRecordCount() == 0 || child.QueueID == ([16]byte{}) {
+			return errors.New("checkpoint contains an invalid recovery tail")
+		}
+		if _, exists := seen[child.PartitionKey]; exists {
+			return errors.New("checkpoint contains duplicate partition tails")
+		}
+		seen[child.PartitionKey] = struct{}{}
+		bytes := orderedLogsTailSize(child)
+		if bytes > c.settings.MaxRecoveryTailBytes-totalBytes {
+			return errors.New("checkpoint exceeds the recovery-tail byte limit")
+		}
+		totalBytes += bytes
+	}
+	for _, child := range checkpoint.children {
+		bytes := orderedLogsWire.LogsSize(child.Request)
+		pref.RefLogs(child.Request)
+		tail := &orderedLogTask{desc: child, bytes: bytes, tailCharge: orderedLogsTailSize(child)}
+		partition := &orderedLogsPartition{key: child.PartitionKey, tail: tail, streamOpen: true}
+		partition.recoveryPending = &orderedLogTask{desc: child, ctx: ctx, bytes: bytes, tailCharge: tail.tailCharge, recoveryTail: true}
+		c.parts[child.PartitionKey] = partition
+	}
+	c.tailBytes = totalBytes
+	return nil
 }
 
 func (c *orderedLogsCoordinator) add(ctx context.Context, group *orderedLogsGroup) error {
@@ -271,8 +444,55 @@ func (c *orderedLogsCoordinator) add(ctx context.Context, group *orderedLogsGrou
 		c.mu.Unlock()
 		return experr.NewShutdownErr(errors.New("ordered stream coordinator is stopped"))
 	}
-	defer c.mu.Unlock()
-	pending := group.children
+	var skipped []*orderedLogTask
+	defer func() { c.mu.Unlock(); finishOrderedTasks(skipped, nil) }()
+	group.mu.Lock()
+	checkpointStore := group.checkpointStore
+	group.mu.Unlock()
+	if !c.restored {
+		if err := c.restoreCheckpointLocked(ctx, checkpointStore); err != nil {
+			// Do not let the persistent queue delete this request when recovery
+			// state cannot be read. ShutdownErr is the queue's existing signal
+			// to leave the dispatched item durable for a later restart.
+			return c.fenceRecoveryLocked(fmt.Errorf("restore ordered stream checkpoint: %w", err))
+		}
+		if group.durable {
+			if reader, ok := checkpointStore.(request.QueueItemReader); ok {
+				body, err := reader.LoadQueueItem(ctx, group.queueToken)
+				if err != nil {
+					return c.fenceRecoveryLocked(fmt.Errorf("refresh ordered queue progress: %w", err))
+				}
+				_, decoded, err := (orderedLogsEncoding{}).Unmarshal(body)
+				if err != nil {
+					return c.fenceRecoveryLocked(err)
+				}
+				refreshed := decoded.(*orderedLogsGroup)
+				if len(refreshed.children) != len(group.children) {
+					return c.fenceRecoveryLocked(errors.New("ordered queue progress changed child count"))
+				}
+				for i, child := range refreshed.children {
+					if child.QueueID != group.children[i].QueueID {
+						return c.fenceRecoveryLocked(errors.New("ordered queue progress changed child identity"))
+					}
+				}
+				group.mu.Lock()
+				group.retired = refreshed.retired
+				group.mu.Unlock()
+			}
+		}
+		c.restored = true
+		c.checkpointStore = checkpointStore
+	}
+	pending := make([]OrderedLogsDescriptor, 0, len(group.children))
+	group.mu.Lock()
+	for _, child := range group.children {
+		if group.retired[child.QueueID] {
+			skipped = append(skipped, &orderedLogTask{group: group})
+		} else {
+			pending = append(pending, child)
+		}
+	}
+	group.mu.Unlock()
 	for !c.stopped && c.staged+len(pending) > c.settings.MaxStaged && !c.groupAdvancesOpenPartitionLocked(group) {
 		// Let a successor through for an already-open partition even after the
 		// staging high-water mark. Queue ownership remains charged, so the
@@ -310,6 +530,15 @@ func (c *orderedLogsCoordinator) add(ctx context.Context, group *orderedLogsGrou
 	}
 	c.scheduleAvailableLocked()
 	return nil
+}
+
+// Recovery cannot skip the current FIFO item and continue with its suffix.
+// Keep subsequent queue items durable until the exporter is restarted.
+func (c *orderedLogsCoordinator) fenceRecoveryLocked(err error) error {
+	c.stopped = true
+	close(c.stop)
+	c.changed.Broadcast()
+	return experr.NewShutdownErr(err)
 }
 
 func (c *orderedLogsCoordinator) groupAdvancesOpenPartitionLocked(group *orderedLogsGroup) bool {
@@ -493,10 +722,19 @@ func (c *orderedLogsCoordinator) succeed(p *orderedLogsPartition, task *orderedL
 		if p.recoveryPending == task {
 			p.recoveryPending = nil
 		}
+		var retired []*orderedLogTask
+		if len(p.tasks) > 0 && p.tail != nil && p.tasks[0].desc.QueueID == p.tail.desc.QueueID {
+			// A crash can persist the tail checkpoint after its ACK but before
+			// the persistent queue deletes that same item. The recovery prelude
+			// already replayed it, so retire the duplicate queue handle now.
+			p.tasks[0].committed = true
+			retired = c.advanceCommittedPrefixLocked(p, epoch)
+		}
 		c.scheduleLocked(p)
 		c.scheduleAvailableLocked()
 		c.changed.Broadcast()
 		c.mu.Unlock()
+		finishOrderedTasks(retired, nil)
 		return
 	}
 	task.committed = true
@@ -540,6 +778,13 @@ func (c *orderedLogsCoordinator) advanceCommittedPrefixLocked(p *orderedLogsPart
 	if c.stopped || p.epoch != epoch {
 		return nil
 	}
+	if err := c.persistTailSnapshotLocked(p, nextTail, p.tasks[:count]...); err != nil {
+		if c.logger != nil {
+			c.logger.Warn("Failed to persist ordered stream recovery tail; keeping queue item fenced", zap.Error(err))
+		}
+		c.scheduleRetirementLocked(p, epoch, time.Second)
+		return nil
+	}
 	p.waitingForTailBudget = false
 	if nextTail == nil {
 		c.clearTailMemoryLocked(p)
@@ -576,12 +821,12 @@ func finishOrderedTasks(tasks []*orderedLogTask, err error) {
 	}
 }
 
-func (c *orderedLogsCoordinator) scheduleRetirementLocked(p *orderedLogsPartition, epoch uint64) {
+func (c *orderedLogsCoordinator) scheduleRetirementLocked(p *orderedLogsPartition, epoch uint64, delay time.Duration) {
 	if p.retirementPending || c.stopped {
 		return
 	}
 	p.retirementPending = true
-	time.AfterFunc(0, func() {
+	time.AfterFunc(delay, func() {
 		c.mu.Lock()
 		if c.stopped || p.epoch != epoch {
 			p.retirementPending = false
@@ -601,9 +846,93 @@ func (c *orderedLogsCoordinator) wakeTailBudgetWaitersLocked() {
 	for _, p := range c.parts {
 		if p.waitingForTailBudget && !p.retirementPending {
 			p.waitingForTailBudget = false
-			c.scheduleRetirementLocked(p, p.epoch)
+			c.scheduleRetirementLocked(p, p.epoch, 0)
 		}
 	}
+}
+
+func (c *orderedLogsCoordinator) persistTailSnapshotLocked(partition *orderedLogsPartition, replacement *OrderedLogsDescriptor, retired ...*orderedLogTask) error {
+	groups := make(map[*orderedLogsGroup]struct{})
+	for _, task := range retired {
+		if task.group == nil {
+			continue
+		}
+		g := task.group
+		g.mu.Lock()
+		if g.retired == nil {
+			g.retired = make(map[[16]byte]bool)
+		}
+		g.retired[task.desc.QueueID] = true
+		g.mu.Unlock()
+		groups[g] = struct{}{}
+	}
+	rollback := func() {
+		for _, task := range retired {
+			if task.group != nil {
+				task.group.mu.Lock()
+				delete(task.group.retired, task.desc.QueueID)
+				task.group.mu.Unlock()
+			}
+		}
+	}
+	if c.checkpointStore == nil {
+		return nil
+	}
+	var updates []request.QueueItemUpdate
+	for g := range groups {
+		if !g.durable {
+			continue
+		}
+		persistCtx := g.persistCtx
+		if persistCtx == nil {
+			persistCtx = context.Background()
+		}
+		value, err := (orderedLogsEncoding{}).Marshal(persistCtx, g)
+		if err != nil {
+			rollback()
+			return err
+		}
+		updates = append(updates, request.QueueItemUpdate{Token: g.queueToken, Value: value})
+	}
+	keys := make([]string, 0, len(c.parts))
+	tails := make(map[string]OrderedLogsDescriptor, len(c.parts))
+	for key, part := range c.parts {
+		if part.tail != nil {
+			tails[key] = part.tail.desc
+		}
+	}
+	if replacement == nil {
+		delete(tails, partition.key)
+	} else {
+		tails[partition.key] = *replacement
+	}
+	for key := range tails {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	checkpoint := &orderedLogsGroup{children: make([]OrderedLogsDescriptor, 0, len(keys))}
+	for _, key := range keys {
+		desc := tails[key]
+		checkpoint.children = append(checkpoint.children, desc)
+	}
+	encoded, err := (orderedLogsEncoding{}).Marshal(context.Background(), checkpoint)
+	if err != nil {
+		rollback()
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if transaction, ok := c.checkpointStore.(request.QueueCheckpointTransaction); ok {
+		err = transaction.SaveCheckpointAndItems(ctx, orderedLogsCheckpointKey, encoded, updates)
+	} else if len(updates) > 0 {
+		err = errors.New("ordered queue cannot atomically checkpoint child progress")
+	} else {
+		err = c.checkpointStore.SaveCheckpoint(ctx, orderedLogsCheckpointKey, encoded)
+	}
+	if err != nil {
+		rollback()
+	}
+	return err
 }
 
 func (c *orderedLogsCoordinator) fail(p *orderedLogsPartition, task *orderedLogTask, epoch uint64, err error) {
@@ -613,8 +942,11 @@ func (c *orderedLogsCoordinator) fail(p *orderedLogsPartition, task *orderedLogT
 		return
 	}
 	if consumererror.IsPermanent(err) || !c.retryCfg.Enabled || c.retryExpiredLocked(p) {
-		failed := c.terminatePartitionLocked(p)
+		failed, persistErr := c.terminatePartitionLocked(p)
 		c.mu.Unlock()
+		if persistErr != nil {
+			err = experr.NewShutdownErr(persistErr)
+		}
 		finishOrderedTasks(failed, err)
 		return
 	}
@@ -624,8 +956,11 @@ func (c *orderedLogsCoordinator) fail(p *orderedLogsPartition, task *orderedLogT
 	}
 	delay := p.backoff.NextBackOff()
 	if delay == backoff.Stop {
-		failed := c.terminatePartitionLocked(p)
+		failed, persistErr := c.terminatePartitionLocked(p)
 		c.mu.Unlock()
+		if persistErr != nil {
+			err = experr.NewShutdownErr(persistErr)
+		}
 		finishOrderedTasks(failed, err)
 		return
 	}
@@ -679,7 +1014,7 @@ func (c *orderedLogsCoordinator) fail(p *orderedLogsPartition, task *orderedLogT
 	c.mu.Unlock()
 }
 
-func (c *orderedLogsCoordinator) terminatePartitionLocked(p *orderedLogsPartition) []*orderedLogTask {
+func (c *orderedLogsCoordinator) terminatePartitionLocked(p *orderedLogsPartition) ([]*orderedLogTask, error) {
 	p.epoch++
 	if p.attemptCancel != nil {
 		p.attemptCancel()
@@ -704,11 +1039,15 @@ func (c *orderedLogsCoordinator) terminatePartitionLocked(p *orderedLogsPartitio
 	p.active, p.activeTask = false, nil
 	p.tasks, p.recoveryPending = nil, nil
 	p.streamOpen = false
+	persistErr := c.persistTailSnapshotLocked(p, nil, failed...)
+	if persistErr != nil && c.logger != nil {
+		c.logger.Warn("Failed to persist terminal ordered stream outcome", zap.Error(persistErr))
+	}
 	c.clearTailMemoryLocked(p)
 	delete(c.parts, p.key)
 	c.changed.Broadcast()
 	c.scheduleAvailableLocked()
-	return failed
+	return failed, persistErr
 }
 
 // scheduleAvailableLocked uses any newly available write permits for other
@@ -800,6 +1139,8 @@ func (c *orderedLogsCoordinator) shutdown() {
 			}
 		}
 		if p.tail != nil {
+			// Keep the durable checkpoint. It is needed if an open stream is
+			// restarted after this exporter shuts down.
 			c.clearTailMemoryLocked(p)
 		}
 		p.recoveryPending = nil
@@ -860,7 +1201,7 @@ func NewLogsRequests(
 	}
 	coordinator = newOrderedLogsCoordinator(limits, pusher, be.retryCfg, be.timeoutCfg.Timeout, maxWorkers, set.Logger)
 	be.asyncShutdown = component.ShutdownFunc(func(context.Context) error {
-		coordinator.shutdown()
+		coordinator.shutdown() //nolint:contextcheck // Durable cleanup uses a bounded context independent of shutdown cancellation.
 		return nil
 	})
 	convert := func(ctx context.Context, ld plog.Logs) (request.Request, error) {
@@ -868,7 +1209,7 @@ func NewLogsRequests(
 		if err != nil {
 			return nil, err
 		}
-		group := &orderedLogsGroup{children: append([]OrderedLogsDescriptor(nil), descriptors...)}
+		group := &orderedLogsGroup{children: append([]OrderedLogsDescriptor(nil), descriptors...), persistCtx: ctx}
 		for i := range group.children {
 			child := &group.children[i]
 			if child.QueueID == ([16]byte{}) {
@@ -892,4 +1233,7 @@ func NewLogsRequests(
 	return &logsExporter{BaseExporter: be, Logs: logsConsumer}, nil
 }
 
-var _ queue.ReferenceCounter[request.Request] = orderedLogsReferenceCounter{}
+var (
+	_ queue.Encoding[request.Request]         = orderedLogsEncoding{}
+	_ queue.ReferenceCounter[request.Request] = orderedLogsReferenceCounter{}
+)
