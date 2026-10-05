@@ -58,3 +58,16 @@ constructor enables ordered restart replay. Other exporters retain their
 existing recovery path by default and can opt into original-index replay with
 `xexporterhelper.QueueBatchSettings.ReplayInOrder`. That setting controls queue
 recovery order; the ordered constructor also schedules partition writes.
+
+## Validation
+
+`xexporterhelper` is a separate Go module. Running `go test ./...` in
+`exporter/exporterhelper` does not run its public API tests. From the Collector
+repository root, test both modules explicitly:
+
+```sh
+(cd exporter/exporterhelper && go test -race -count=1 ./...)
+(cd exporter/exporterhelper/xexporterhelper && go test -race -count=1 ./...)
+```
+
+Run `go build ./...` and `go vet ./...` in each module as well.
