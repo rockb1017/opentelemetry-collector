@@ -89,3 +89,74 @@ func TestReplayLoadFailurePreservesDispatchedOwnership(t *testing.T) {
 	require.ErrorIs(t, pq.startupErr, client.failure)
 	require.Equal(t, []uint64{0}, pq.metadata.CurrentlyDispatchedItems)
 }
+
+func TestCheckpointPayloadIsNotInterpretedAsJournal(t *testing.T) {
+	values := []struct {
+		name  string
+		value []byte
+	}{
+		{name: "empty", value: []byte{}},
+		{name: "plain", value: []byte("tail")},
+		{name: "journal_header", value: append([]byte(nil), checkpointJournalMagic...)},
+		{name: "nested_journal", value: encodeCheckpointJournal([]byte("inner"), []request.QueueItemUpdate{{Token: 1, Value: []byte("payload")}})},
+	}
+	for _, mode := range []string{"checkpoint", "compacted", "recovered"} {
+		for _, value := range values {
+			t.Run(mode+"/"+value.name, func(t *testing.T) {
+				ctx := context.Background()
+				client := &checkpointFaultClient{Client: newFakeBoundedStorageClient(1 << 20), failure: errors.New("interrupted item update")}
+				pq := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeRequests, 10)).(*persistentQueue[intRequest])
+				pq.initClient(ctx, client)
+				require.NoError(t, client.Set(ctx, "1", []byte("old")))
+				if mode == "checkpoint" {
+					require.NoError(t, pq.SaveCheckpoint(ctx, "ordered", value.value))
+				} else {
+					if mode == "recovered" {
+						client.setKey = "1"
+					}
+					require.NoError(t, pq.SaveCheckpointAndItems(ctx, "ordered", value.value, []request.QueueItemUpdate{{Token: 1, Value: []byte("retired")}}))
+					client.setKey = ""
+				}
+				restarted := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeRequests, 10)).(*persistentQueue[intRequest])
+				restarted.initClient(ctx, client)
+				// Read twice: recovery must preserve the framing when it trims
+				// the journal, so the next read still treats the value as opaque.
+				for range 2 {
+					got, found, err := restarted.LoadCheckpoint(ctx, "ordered")
+					require.NoError(t, err)
+					require.True(t, found)
+					require.Equal(t, value.value, got)
+				}
+				body, err := restarted.LoadQueueItem(ctx, 1)
+				require.NoError(t, err)
+				if mode == "checkpoint" {
+					require.Equal(t, "old", string(body), "checkpoint payload must not update queue items")
+				} else {
+					require.Equal(t, "retired", string(body))
+				}
+			})
+		}
+	}
+}
+
+func TestCheckpointLoadsLegacyUnframedValue(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeBoundedStorageClient(1 << 20)
+	pq := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeRequests, 10)).(*persistentQueue[intRequest])
+	pq.initClient(ctx, client)
+	value := []byte("legacy ordered recovery tail")
+	require.NoError(t, client.Set(ctx, "ocp/ordered", value))
+	got, found, err := pq.LoadCheckpoint(ctx, "ordered")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, value, got)
+	// A subsequent save upgrades the representation without changing the value.
+	require.NoError(t, pq.SaveCheckpoint(ctx, "ordered", value))
+	stored, err := client.Get(ctx, "ocp/ordered")
+	require.NoError(t, err)
+	require.NotEqual(t, value, stored)
+	got, found, err = pq.LoadCheckpoint(ctx, "ordered")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, value, got)
+}

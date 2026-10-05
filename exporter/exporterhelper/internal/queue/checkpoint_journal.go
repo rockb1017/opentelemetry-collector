@@ -15,9 +15,8 @@ import (
 var checkpointJournalMagic = []byte{'O', 'C', 'J', 1}
 
 func encodeCheckpointJournal(value []byte, updates []request.QueueItemUpdate) []byte {
-	if len(updates) == 0 {
-		return value
-	}
+	// Always frame the value, including after journal compaction. An opaque
+	// checkpoint payload may itself start with the journal header.
 	var out bytes.Buffer
 	out.Write(checkpointJournalMagic)
 	_ = binary.Write(&out, binary.BigEndian, uint64(len(value)))
@@ -33,6 +32,7 @@ func encodeCheckpointJournal(value []byte, updates []request.QueueItemUpdate) []
 
 func decodeCheckpointJournal(data []byte) ([]byte, []request.QueueItemUpdate, error) {
 	if !bytes.HasPrefix(data, checkpointJournalMagic) {
+		// Older checkpoints without pending item updates stored the value raw.
 		return data, nil, nil
 	}
 	r := bytes.NewReader(data[len(checkpointJournalMagic):])

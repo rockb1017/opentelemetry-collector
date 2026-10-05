@@ -313,7 +313,7 @@ func (pq *persistentQueue[T]) LoadCheckpoint(ctx context.Context, key string) ([
 		if err := pq.applyCheckpointItems(ctx, updates); err != nil {
 			return nil, false, err
 		}
-		if err := pq.client.Set(ctx, "ocp/"+key, value); err != nil {
+		if err := pq.client.Set(ctx, "ocp/"+key, encodeCheckpointJournal(value, nil)); err != nil {
 			return nil, false, err
 		}
 	}
@@ -387,7 +387,7 @@ func (pq *persistentQueue[T]) SaveCheckpointAndItems(ctx context.Context, key st
 			return nil
 		}
 		// Failure to trim is safe: applying the journal again is idempotent.
-		if err := pq.client.Set(ctx, "ocp/"+key, value); err != nil {
+		if err := pq.client.Set(ctx, "ocp/"+key, encodeCheckpointJournal(value, nil)); err != nil {
 			pq.logger.Warn("Unable to trim ordered queue recovery journal", zap.Error(err))
 		}
 	}
