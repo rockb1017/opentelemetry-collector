@@ -5,6 +5,5 @@ issues: [15475]
 subtext: |
   xexporterhelper.NewLogsRequests supports atomic child admission and independent
   write release and acknowledgement completion using memory queues. Open streams
-  retain bounded recovery state for live retries. Persistent storage is not yet
-  supported by this constructor.
+  retain bounded recovery state for live retries.
 change_logs: [api]

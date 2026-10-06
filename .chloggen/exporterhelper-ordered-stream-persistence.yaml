@@ -1,0 +1,10 @@
+change_type: enhancement
+component: pkg/xexporterhelper
+note: Support persistent storage and ordered restart replay for the experimental logs request constructor.
+issues: [15475]
+subtext: |
+  Persist child retirement and bounded recovery tails for ordered streams.
+  Other exporters can opt into original-index restart replay through
+  xexporterhelper.QueueBatchSettings.ReplayInOrder. Existing persistent queue
+  recovery remains unchanged unless the option is enabled.
+change_logs: [api]

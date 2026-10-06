@@ -20,6 +20,9 @@ type Settings[T any] struct {
 	Encoding         queue.Encoding[T]
 	Partitioner      Partitioner[T]
 	MergeCtx         func(context.Context, context.Context) context.Context
+	// ReplayInOrder controls persisted dequeue order on restart. In-flight
+	// items retain their original indices and precede newer queued work.
+	ReplayInOrder bool
 }
 
 // AllSettings defines settings for creating a QueueBatch.
@@ -63,6 +66,7 @@ func NewQueueBatch(
 		SizerType:        cfg.Sizer,
 		Capacity:         cfg.QueueSize,
 		NumConsumers:     cfg.NumConsumers,
+		ReplayInOrder:    set.ReplayInOrder,
 		WaitForResult:    cfg.WaitForResult,
 		BlockOnOverflow:  cfg.BlockOnOverflow,
 		Signal:           set.Signal,
@@ -89,9 +93,6 @@ func NewAsyncQueueBatch(
 	if next == nil {
 		return nil, errors.New("async queue batch: nil send function")
 	}
-	if cfg.StorageID != nil {
-		return nil, errors.New("ordered stream persistent queues are not supported")
-	}
 	if cfg.Batch.HasValue() {
 		return nil, errors.New("async queue batch: batching is not supported for ordered stream requests")
 	}
@@ -99,11 +100,13 @@ func NewAsyncQueueBatch(
 	// Keep one FIFO queue reader. Ordered stream scheduling owns the configured
 	// cross-partition write concurrency after the reader has staged each item.
 	cfg.NumConsumers = 1
+	var checkpointStore request.QueueCheckpointStore
 	q, err := queue.NewQueue(queue.Settings[request.Request]{
 		SizerType:         cfg.Sizer,
 		Capacity:          cfg.QueueSize,
 		NumConsumers:      cfg.NumConsumers,
 		WaitForCompletion: true,
+		ReplayInOrder:     true,
 		WaitForResult:     cfg.WaitForResult,
 		BlockOnOverflow:   cfg.BlockOnOverflow,
 		Signal:            set.Signal,
@@ -113,6 +116,9 @@ func NewAsyncQueueBatch(
 		ID:                set.ID,
 		Telemetry:         set.Telemetry,
 	}, func(ctx context.Context, req request.Request, done queue.Done) {
+		if requestWithCheckpoint, ok := req.(request.QueueCheckpointStoreSetter); ok {
+			requestWithCheckpoint.SetQueueCheckpointStore(checkpointStore)
+		}
 		deferred, ok := req.(request.DeferredQueueCompletion)
 		if !ok {
 			done.OnDone(errors.New("async queue requires a deferred-completion request"))
@@ -131,6 +137,12 @@ func NewAsyncQueueBatch(
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Queue wrappers expose checkpoint methods even around a memory queue.
+	// Only attach a store when persistence was configured; otherwise each ACK
+	// serializes every open partition's tails for a save that is a no-op.
+	if cfg.StorageID != nil {
+		checkpointStore, _ = q.(request.QueueCheckpointStore)
 	}
 	return &QueueBatch{queue: q, batcher: &asyncBatcher{}}, nil
 }
